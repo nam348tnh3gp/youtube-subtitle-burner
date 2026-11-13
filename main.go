@@ -4,6 +4,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"time"
+	"sync"
+	"bufio"
 	"log"
 	"net/http"
 	"net/url"
@@ -84,6 +87,9 @@ func main() {
 
 	// API: Lấy embed URL để preview video trên iframe
 	r.POST("/api/preview", handlePreview)
+
+// API: SSE stream tiến trình realtime
+r.GET("/api/progress/:taskID", handleProgressSSE)
 
 	// Chạy server
 	port := os.Getenv("PORT")
@@ -173,193 +179,316 @@ func listSubtitlesViaCLI(videoURL string) ([]SubtitleInfo, string, error) {
 	return subs, title, nil
 }
 
+// ============================================================
+// PROGRESS TRACKER — theo dõi tiến trình từng task
+// ============================================================
+type TaskProgress struct {
+Step     string  `json:"step"`     // "download" | "subtitle" | "convert" | "burn" | "done" | "error"
+Percent  int     `json:"percent"`  // 0-100
+Message  string  `json:"message"`
+VideoURL string  `json:"video_url,omitempty"`
+Error    string  `json:"error,omitempty"`
+}
+
+var (
+progressMu sync.RWMutex
+progressMap = map[string]*TaskProgress{}
+)
+
+func setProgress(taskID, step string, percent int, message string) {
+progressMu.Lock()
+defer progressMu.Unlock()
+if p, ok := progressMap[taskID]; ok {
+p.Step = step
+p.Percent = percent
+p.Message = message
+}
+}
+
+func setProgressDone(taskID, videoURL string) {
+progressMu.Lock()
+defer progressMu.Unlock()
+if p, ok := progressMap[taskID]; ok {
+p.Step = "done"
+p.Percent = 100
+p.Message = "Done"
+p.VideoURL = videoURL
+}
+}
+
+func setProgressError(taskID, msg string) {
+progressMu.Lock()
+defer progressMu.Unlock()
+if p, ok := progressMap[taskID]; ok {
+p.Step = "error"
+p.Message = msg
+p.Error = msg
+}
+}
+
+func getProgress(taskID string) TaskProgress {
+progressMu.RLock()
+defer progressMu.RUnlock()
+if p, ok := progressMap[taskID]; ok {
+return *p
+}
+return TaskProgress{Step: "unknown"}
+}
+
+// handleProgressSSE: SSE stream tiến trình realtime
+func handleProgressSSE(c *gin.Context) {
+taskID := c.Param("taskID")
+if taskID == "" {
+c.JSON(http.StatusBadRequest, gin.H{"error": "Missing taskID"})
+return
+}
+
+c.Writer.Header().Set("Content-Type", "text/event-stream")
+c.Writer.Header().Set("Cache-Control", "no-cache")
+c.Writer.Header().Set("Connection", "keep-alive")
+c.Writer.Header().Set("X-Accel-Buffering", "no")
+
+flusher, ok := c.Writer.(http.Flusher)
+if !ok {
+c.JSON(http.StatusInternalServerError, gin.H{"error": "SSE not supported"})
+return
+}
+
+ticker := time.NewTicker(500 * time.Millisecond)
+defer ticker.Stop()
+
+timeout := time.After(30 * time.Minute)
+
+for {
+select {
+case <-c.Request.Context().Done():
+return
+case <-timeout:
+fmt.Fprintf(c.Writer, "event: timeout\ndata: {}\n\n")
+flusher.Flush()
+return
+case <-ticker.C:
+p := getProgress(taskID)
+data, _ := json.Marshal(p)
+fmt.Fprintf(c.Writer, "data: %s\n\n", data)
+flusher.Flush()
+if p.Step == "done" || p.Step == "error" {
+return
+}
+}
+}
+}
+
 // handleBurnSubtitles: Tải video, tải phụ đề, chuyển sang ASS với font size, ghép cứng, trả về link.
 func handleBurnSubtitles(c *gin.Context) {
-	var req BurnRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Dữ liệu không hợp lệ: " + err.Error()})
-		return
-	}
-	// URL không bắt buộc nếu có video upload hoặc phụ đề upload
-	if strings.TrimSpace(req.URL) == "" && strings.TrimSpace(req.VideoData) == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Cần nhập link YouTube hoặc upload video"})
-		return
-	}
+var req BurnRequest
+if err := c.ShouldBindJSON(&req); err != nil {
+c.JSON(http.StatusBadRequest, gin.H{"error": "Dữ liệu không hợp lệ: " + err.Error()})
+return
+}
+if strings.TrimSpace(req.URL) == "" && strings.TrimSpace(req.VideoData) == "" {
+c.JSON(http.StatusBadRequest, gin.H{"error": "Cần nhập link YouTube hoặc upload video"})
+return
+}
 
-	// Tạo ID duy nhất cho tác vụ
-	taskID := uuid.New().String()
-	workDir := filepath.Join("./tmp", taskID)
-	if err := os.MkdirAll(workDir, os.ModePerm); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Không tạo được thư mục tạm"})
-		return
-	}
+taskID := uuid.New().String()
 
-	// Đường dẫn file
-	videoPath := filepath.Join(workDir, "video.mp4")
-	subPath := filepath.Join(workDir, "subtitle."+req.Lang+".vtt") // yt-dlp mặc định tải VTT
-	assPath := filepath.Join(workDir, "subtitle.ass")
-	outputPath := filepath.Join(workDir, "output.mp4")
+// Khởi tạo progress
+progressMu.Lock()
+progressMap[taskID] = &TaskProgress{Step: "queued", Percent: 0, Message: "Queued"}
+progressMu.Unlock()
 
-	// Bước 1: Lấy video — ưu tiên file upload nếu có, ngược lại tải từ YouTube
-	if strings.TrimSpace(req.VideoData) != "" {
-		// Người dùng import video có sẵn
-		raw, err := base64.StdEncoding.DecodeString(req.VideoData)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Dữ liệu video base64 không hợp lệ: " + err.Error()})
-			return
-		}
-		// Giữ đuôi file gốc để FFmpeg tự nhận diện container
-		ext := filepath.Ext(req.VideoName)
-		if ext == "" {
-			ext = ".mp4"
-		}
-		videoPath = filepath.Join(workDir, "uploaded_video"+ext)
-		if err := os.WriteFile(videoPath, raw, 0644); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Không ghi được file video upload"})
-			return
-		}
-		log.Printf("[%s] Dùng video upload: %s (%d bytes)", taskID, videoPath, len(raw))
-	} else {
-		if strings.TrimSpace(req.URL) == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Cần nhập link YouTube hoặc upload video"})
-			return
-		}
-		log.Printf("[%s] Đang tải video: %s", taskID, req.URL)
-		formatSel := buildFormatSelector(req.Quality)
-		log.Printf("[%s] Format selector: %s", taskID, formatSel)
-		downloadCmd := exec.Command("yt-dlp",
-			"-f", formatSel,
-			"--merge-output-format", "mp4",
-			"-o", videoPath,
-			"--no-warnings",
-			req.URL,
-		)
-		downloadCmd.Stdout = os.Stdout
-		downloadCmd.Stderr = os.Stderr
-		if err := downloadCmd.Run(); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Tải video thất bại: " + err.Error()})
-			return
-		}
-	}
+// Trả task_id NGAY để frontend mở SSE
+c.JSON(http.StatusOK, gin.H{
+"task_id": taskID,
+"message": "Bắt đầu xử lý",
+})
 
-	// Bước 2: Lấy phụ đề — ưu tiên file upload nếu có, ngược lại tải từ YouTube
-	if strings.TrimSpace(req.SubtitleData) != "" {
-		// Người dùng import phụ đề có sẵn
-		ext := ".vtt"
-		if strings.HasSuffix(strings.ToLower(req.SubtitleName), ".srt") {
-			ext = ".srt"
-		}
-		subPath = filepath.Join(workDir, "uploaded_subtitle"+ext)
-		raw, err := base64.StdEncoding.DecodeString(req.SubtitleData)
-		if err != nil {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "Dữ liệu phụ đề base64 không hợp lệ: " + err.Error()})
-			return
-		}
-		if err := os.WriteFile(subPath, raw, 0644); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Không ghi được file phụ đề upload"})
-			return
-		}
-		log.Printf("[%s] Dùng phụ đề upload: %s (%d bytes)", taskID, subPath, len(raw))
+// Chạy nền
+go processBurnTask(taskID, req)
+}
+
+// processBurnTask: chạy toàn bộ pipeline và cập nhật progress
+func processBurnTask(taskID string, req BurnRequest) {
+defer func() {
+if r := recover(); r != nil {
+setProgressError(taskID, fmt.Sprintf("panic: %v", r))
+}
+}()
+
+workDir := filepath.Join("./tmp", taskID)
+if err := os.MkdirAll(workDir, os.ModePerm); err != nil {
+setProgressError(taskID, "Không tạo được thư mục tạm: "+err.Error())
+return
+}
+
+videoPath := filepath.Join(workDir, "video.mp4")
+subPath := filepath.Join(workDir, "subtitle."+req.Lang+".vtt")
+assPath := filepath.Join(workDir, "subtitle.ass")
+outputPath := filepath.Join(workDir, "output.mp4")
+
+// ===== Bước 1: Video =====
+setProgress(taskID, "download", 5, "Preparing video...")
+if strings.TrimSpace(req.VideoData) != "" {
+setProgress(taskID, "download", 10, "Decoding uploaded video...")
+raw, err := base64.StdEncoding.DecodeString(req.VideoData)
+if err != nil {
+setProgressError(taskID, "Video base64 không hợp lệ: "+err.Error())
+return
+}
+ext := filepath.Ext(req.VideoName)
+if ext == "" {
+ext = ".mp4"
+}
+videoPath = filepath.Join(workDir, "uploaded_video"+ext)
+if err := os.WriteFile(videoPath, raw, 0644); err != nil {
+setProgressError(taskID, "Không ghi được video upload: "+err.Error())
+return
+}
+setProgress(taskID, "download", 30, fmt.Sprintf("Video ready (%d bytes)", len(raw)))
 } else {
-// Tải từ YouTube: ưu tiên cookies thủ công nếu có
+setProgress(taskID, "download", 10, "Downloading video from YouTube...")
+formatSel := buildFormatSelector(req.Quality)
+downloadCmd := exec.Command("yt-dlp",
+"-f", formatSel,
+"--merge-output-format", "mp4",
+"-o", videoPath,
+"--newline",
+"--no-warnings",
+req.URL,
+)
+downloadCmd.Stdout = os.Stdout
+downloadCmd.Stderr = os.Stderr
+if err := downloadCmd.Run(); err != nil {
+setProgressError(taskID, "Tải video thất bại: "+err.Error())
+return
+}
+setProgress(taskID, "download", 30, "Video downloaded")
+}
+
+// ===== Bước 2: Subtitle =====
+setProgress(taskID, "subtitle", 35, "Preparing subtitles...")
+if strings.TrimSpace(req.SubtitleData) != "" {
+ext := ".vtt"
+if strings.HasSuffix(strings.ToLower(req.SubtitleName), ".srt") {
+ext = ".srt"
+}
+subPath = filepath.Join(workDir, "uploaded_subtitle"+ext)
+raw, err := base64.StdEncoding.DecodeString(req.SubtitleData)
+if err != nil {
+setProgressError(taskID, "Subtitle base64 không hợp lệ: "+err.Error())
+return
+}
+if err := os.WriteFile(subPath, raw, 0644); err != nil {
+setProgressError(taskID, "Không ghi được subtitle upload: "+err.Error())
+return
+}
+setProgress(taskID, "subtitle", 45, "Subtitle loaded (uploaded)")
+} else {
+setProgress(taskID, "subtitle", 40, "Downloading subtitles...")
 langPattern := req.Lang
 if !strings.Contains(langPattern, "*") {
 langPattern = langPattern + ".*"
 }
-
 var cookiesFilePath string
 if strings.TrimSpace(req.CookiesData) != "" {
 cookiesFilePath = filepath.Join(workDir, "cookies.txt")
 if err := writeCookiesFile(cookiesFilePath, req.CookiesData, req.CookiesFormat); err != nil {
-c.JSON(http.StatusBadRequest, gin.H{"error": "Cookies không hợp lệ: " + err.Error()})
+setProgressError(taskID, "Cookies không hợp lệ: "+err.Error())
 return
 }
-log.Printf("[%s] Dùng cookies thủ công (format=%s): %s",
-taskID, req.CookiesFormat, cookiesFilePath)
-} else {
-log.Printf("[%s] Tải phụ đề: %s (browser=%s, player=%s)",
-taskID, req.Lang, req.Client, req.Player)
 }
-
 var errSub error
 subPath, errSub = downloadSubtitlesWithCookies(
 workDir, req.URL, langPattern, cookiesFilePath, req.Client, req.Player)
 if errSub != nil {
-c.JSON(http.StatusInternalServerError, gin.H{"error": "Tải phụ đề thất bại: " + errSub.Error()})
+setProgressError(taskID, "Tải phụ đề thất bại: "+errSub.Error())
 return
 }
+setProgress(taskID, "subtitle", 55, "Subtitles downloaded")
 }
-	log.Printf("[%s] File phụ đề: %s", taskID, subPath)
 
-	// Bước 3: Chuyển VTT sang ASS với font size tùy chỉnh
-	// Sử dụng FFmpeg để convert, đồng thời chèn style với FontSize mong muốn.
-	// Cách đơn giản: dùng filter subtitles với force_style.
-	// Tuy nhiên force_style không phải lúc nào cũng hoạt động tốt với ASS.
-	// Cách ổn định hơn: tạo file ASS trực tiếp bằng cách chuyển đổi qua ffmpeg,
-	// sau đó sửa header ASS để đặt PlayRes và FontSize.
-	// Ở đây, để đơn giản và hiệu quả, ta dùng ffmpeg convert VTT -> ASS,
-	// rồi dùng filter subtitles với force_style khi burn.
-	// force_style có thể set FontSize.
-	log.Printf("[%s] Đang chuyển đổi phụ đề sang ASS...", taskID)
+// ===== Bước 3: Convert VTT → ASS =====
+setProgress(taskID, "convert", 60, "Converting subtitles to ASS...")
+convertCmd := exec.Command("ffmpeg",
+"-y",
+"-i", subPath,
+assPath,
+)
+convertCmd.Stdout = nil
+convertCmd.Stderr = nil
+if err := convertCmd.Run(); err != nil {
+log.Printf("[%s] Convert ASS thất bại, dùng VTT: %v", taskID, err)
+assPath = subPath
+setProgress(taskID, "convert", 65, "Using VTT directly")
+} else {
+setProgress(taskID, "convert", 70, "Converted to ASS")
+}
 
-	// Chuyển VTT sang ASS bằng ffmpeg (không burn, chỉ convert)
-	convertCmd := exec.Command("ffmpeg",
-		"-i", subPath,
-		assPath,
-	)
-	convertCmd.Stdout = os.Stdout
-	convertCmd.Stderr = os.Stderr
-	if err := convertCmd.Run(); err != nil {
-		// Nếu convert thất bại, thử dùng trực tiếp file VTT với force_style
-		log.Printf("[%s] Convert ASS thất bại, sẽ dùng VTT trực tiếp: %v", taskID, err)
-		assPath = subPath // fallback dùng VTT
-	}
+// ===== Bước 4: Burn =====
+setProgress(taskID, "burn", 72, "Burning subtitles into video...")
+filter := fmt.Sprintf("subtitles='%s':force_style='FontSize=%d'",
+escapePathForFFmpeg(assPath), req.FontSize)
 
-	// Bước 4: Ghép cứng phụ đề vào video với font size tùy chỉnh
-	// Sử dụng filter "subtitles" với force_style để set FontSize.
-	// FFmpeg filter: subtitles=filename:force_style='FontSize=24'
-	// Cần escape đường dẫn đúng cách.
-	log.Printf("[%s] Đang ghép cứng phụ đề (FontSize=%d)...", taskID, req.FontSize)
+burnCmd := exec.Command("ffmpeg",
+"-y",
+"-i", videoPath,
+"-vf", filter,
+"-c:v", "libx264",
+"-preset", "fast",
+"-crf", "23",
+"-c:a", "aac",
+"-b:a", "128k",
+"-movflags", "+faststart",
+"-progress", "pipe:1",
+"-nostats",
+outputPath,
+)
+// Đọc progress từ stderr của ffmpeg (chứa "time=HH:MM:SS")
+stdoutPipe, err := burnCmd.StdoutPipe()
+if err != nil {
+setProgressError(taskID, "Không đọc được ffmpeg output: "+err.Error())
+return
+}
+burnCmd.Stderr = nil
+if err := burnCmd.Start(); err != nil {
+setProgressError(taskID, "Không chạy được ffmpeg: "+err.Error())
+return
+}
 
-	// Xây dựng filter string
-	// Đối với ASS, force_style có thể override FontSize.
-	// Đối với VTT, ffmpeg sẽ render với style mặc định, force_style cũng có tác dụng.
-	filter := fmt.Sprintf("subtitles='%s':force_style='FontSize=%d'",
-		escapePathForFFmpeg(assPath), req.FontSize)
+// Đọc progress từ pipe
+scanner := bufio.NewScanner(stdoutPipe)
+lastPercent := 72
+for scanner.Scan() {
+line := scanner.Text()
+// ffmpeg -progress xuất "out_time_ms=..." hoặc "out_time_us=..."
+if strings.HasPrefix(line, "out_time_ms=") || strings.HasPrefix(line, "out_time_us=") {
+val := strings.SplitN(line, "=", 2)
+if len(val) == 2 {
+if us, err := strconv.ParseInt(val[1], 10, 64); err == nil && us > 0 {
+// Giả sử video dài tối đa 3600s (1h), map 0-100%
+seconds := float64(us) / 1_000_000.0
+percent := 72 + int(seconds/3600.0*28)
+if percent > 99 {
+percent = 99
+}
+if percent > lastPercent {
+lastPercent = percent
+setProgress(taskID, "burn", percent, fmt.Sprintf("Burning... %d%%", percent))
+}
+}
+}
+}
+}
 
-	burnCmd := exec.Command("ffmpeg",
-		"-i", videoPath,
-		"-vf", filter,
-		"-c:v", "libx264",
-		"-preset", "fast",
-		"-crf", "23",
-		"-c:a", "aac",
-		"-b:a", "128k",
-		"-movflags", "+faststart",
-		outputPath,
-	)
-	burnCmd.Stdout = os.Stdout
-	burnCmd.Stderr = os.Stderr
-	if err := burnCmd.Run(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ghép phụ đề thất bại: " + err.Error()})
-		return
-	}
+if err := burnCmd.Wait(); err != nil {
+setProgressError(taskID, "Ghép phụ đề thất bại: "+err.Error())
+return
+}
 
-	// Bước 5: Trả về URL video kết quả
-	// Video nằm trong ./tmp/{taskID}/output.mp4, được serve qua route /tmp
-	videoURL := fmt.Sprintf("/tmp/%s/output.mp4", taskID)
-
-	log.Printf("[%s] Hoàn tất! Video: %s", taskID, videoURL)
-	c.JSON(http.StatusOK, BurnResponse{
-		VideoURL: videoURL,
-		Message:  "Xử lý thành công!",
-	})
-
-	// Dọn dẹp file tạm (video gốc, phụ đề) sau khi trả về, giữ lại output.mp4
-	// Có thể bỏ qua để debug
-	// os.Remove(videoPath)
-	// os.Remove(subPath)
-	// os.Remove(assPath)
+videoURL := fmt.Sprintf("/tmp/%s/output.mp4", taskID)
+setProgressDone(taskID, videoURL)
+log.Printf("[%s] Hoàn tất: %s", taskID, videoURL)
 }
 
 // escapePathForFFmpeg xử lý đường dẫn để dùng trong filter của FFmpeg.
