@@ -210,6 +210,10 @@
         const cookiesBox = document.getElementById('cookiesBox');
         const cookiesText = document.getElementById('cookiesText');
         const cookiesFileName = document.getElementById('cookiesFileName');
+        const videoDropzone = document.getElementById('videoDropzone');
+        const videoFileName = document.getElementById('videoFileName');
+        let currentVideoTab = 'youtube';
+        let uploadedVideo = null; // { name, base64 }
         let uploadedCookies = null; // { format, data }
         let currentTab = 'download';
         let uploadedSubtitle = null; // { name, base64 }
@@ -226,8 +230,9 @@
         function switchVideoTab(tab) {
             currentVideoTab = tab;
             document.querySelectorAll('.tab[data-vtab]').forEach(t => t.classList.toggle('active', t.dataset.vtab === tab));
-            document.getElementById('vtab-youtube').classList.toggle('active', tab === 'youtube');
-            document.getElementById('vtab-upload-video').classList.toggle('active', tab === 'upload-video');
+            // Chỉ toggle các tab-content thuộc nhóm video (id bắt đầu bằng "vtab-")
+            document.querySelectorAll('.tab-content[id^="vtab-"]').forEach(c => c.classList.remove('active'));
+            document.getElementById('vtab-' + tab.replace('upload-video', 'upload-video')).classList.add('active');
             updateBurnButtonState();
         }
 
@@ -272,8 +277,9 @@
         // ===== Tabs nguồn phụ đề =====
         function switchTab(tab) {
             currentTab = tab;
-            document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
-            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            document.querySelectorAll('.tab[data-tab]').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+            // Chỉ toggle các tab-content thuộc nhóm subtitle (id bắt đầu bằng "tab-")
+            document.querySelectorAll('.tab-content[id^="tab-"]').forEach(c => c.classList.remove('active'));
             document.getElementById('tab-' + tab).classList.add('active');
             updateBurnButtonState();
         }
