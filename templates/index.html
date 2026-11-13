@@ -46,6 +46,15 @@
         .inline-radio { display: flex; gap: 1rem; margin: 0.5rem 0; }
         .inline-radio label { display: flex; align-items: center; gap: 0.35rem; font-weight: 500; margin: 0; cursor: pointer; }
         .inline-radio input { width: auto; }
+
+        .progress-container { margin-top: 1rem; display: none; }
+        .progress-container.active { display: block; }
+        .progress-header { display: flex; justify-content: space-between; font-size: 0.85rem; font-weight: 600; color: #374151; margin-bottom: 0.35rem; }
+        .progress-track { height: 8px; background: #e5e7eb; border-radius: 999px; overflow: hidden; }
+        .progress-bar { height: 100%; width: 0; background: linear-gradient(90deg, #2563eb, #3b82f6); border-radius: 999px; transition: width 0.3s ease; }
+        .progress-bar.error { background: #dc2626; }
+        .progress-bar.done { background: #10b981; }
+        .progress-step { font-size: 0.75rem; color: #6b7280; margin-top: 0.25rem; }
     </style>
 </head>
 <body>
@@ -169,6 +178,17 @@
         </div>
 
         <div id="status" class="status"></div>
+
+        <div id="progressContainer" class="progress-container">
+            <div class="progress-header">
+                <span id="progressLabel">Processing...</span>
+                <span id="progressPercent">0%</span>
+            </div>
+            <div class="progress-track">
+                <div id="progressBar" class="progress-bar"></div>
+            </div>
+            <div id="progressStep" class="progress-step"></div>
+        </div>
     </div>
 
     <div class="grid">
@@ -579,6 +599,81 @@
             const resultBadge = document.getElementById('resultBadge');
             const downloadLink= document.getElementById('downloadLink');
 
+            // Progress bar elements
+            const progressContainer = document.getElementById('progressContainer');
+            const progressBar       = document.getElementById('progressBar');
+            const progressPercent   = document.getElementById('progressPercent');
+            const progressLabel     = document.getElementById('progressLabel');
+            const progressStep      = document.getElementById('progressStep');
+
+            const STEP_LABELS = {
+                queued:   'Queued',
+                download: 'Downloading video',
+                subtitle: 'Fetching subtitles',
+                convert:  'Converting subtitles',
+                burn:     'Burning subtitles',
+                done:     'Completed',
+                error:    'Error',
+            };
+
+            let currentEventSource = null;
+
+            function showProgress() {
+                if (progressContainer) progressContainer.classList.add('active');
+                if (progressBar) {
+                    progressBar.classList.remove('error', 'done');
+                    progressBar.style.width = '0%';
+                }
+                if (progressPercent) progressPercent.textContent = '0%';
+                if (progressLabel) progressLabel.textContent = 'Starting...';
+                if (progressStep) progressStep.textContent = '';
+            }
+
+            function hideProgress() {
+                if (progressContainer) progressContainer.classList.remove('active');
+                if (currentEventSource) {
+                    currentEventSource.close();
+                    currentEventSource = null;
+                }
+            }
+
+            function updateProgress(data) {
+                if (!data || !data.step) return;
+
+                const percent = data.percent || 0;
+                if (progressBar) progressBar.style.width = percent + '%';
+                if (progressPercent) progressPercent.textContent = percent + '%';
+                if (progressLabel) progressLabel.textContent = STEP_LABELS[data.step] || data.step;
+                if (progressStep && data.message) progressStep.textContent = data.message;
+
+                if (data.step === 'done') {
+                    if (progressBar) { progressBar.classList.add('done'); progressBar.style.width = '100%'; }
+                    if (progressPercent) progressPercent.textContent = '100%';
+                    if (progressLabel) progressLabel.textContent = 'Completed';
+                    if (data.video_url) {
+                        if (resultVideo) resultVideo.src = data.video_url;
+                        if (downloadLink) downloadLink.href = data.video_url;
+                        if (resultCard) resultCard.classList.remove('hidden');
+                    }
+                    UI.toast('✅ Burn completed!', 'success');
+                    finalize();
+                } else if (data.step === 'error') {
+                    if (progressBar) progressBar.classList.add('error');
+                    UI.toast('Error: ' + (data.error || data.message || 'Unknown'), 'error');
+                    finalize();
+                }
+            }
+
+            function finalize() {
+                btnBurn.dataset.busy = '0';
+                btnBurn.innerHTML = '🔥 Burn subtitles';
+                Subtitle.updateBurnButton();
+                if (currentEventSource) {
+                    currentEventSource.close();
+                    currentEventSource = null;
+                }
+            }
+
             async function burn() {
                 if (!VideoSource.hasSource()) { UI.toast('Please provide a video source', 'error'); return; }
                 if (!Subtitle.hasSource())    { UI.toast('Please provide a subtitle source', 'error'); return; }
@@ -604,15 +699,15 @@
                     payload.cookies_format = cookiesPayload.format;
                 }
 
-                console.log('[burn] payload:', payload);
-
                 btnBurn.dataset.busy = '1';
                 btnBurn.disabled = true;
-                btnBurn.innerHTML = '<span class="spinner"></span> Processing... (may take a few minutes)';
+                btnBurn.innerHTML = '<span class="spinner"></span> Processing...';
                 UI.hide();
                 if (resultCard) resultCard.classList.add('hidden');
+                showProgress();
 
                 try {
+                    // Bước 1: POST /api/burn → trả task_id ngay
                     const res = await fetch('/api/burn', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
@@ -621,21 +716,31 @@
                     const data = await res.json();
                     if (!res.ok) throw new Error(data.error || 'Unknown error');
 
-                    if (resultVideo) resultVideo.src = data.video_url;
-                    if (downloadLink) downloadLink.href = data.video_url;
-                    if (resultBadge) resultBadge.textContent = qualityEl.value === 'best' ? 'Best' : qualityEl.value + 'p';
-                    if (resultCard) resultCard.classList.remove('hidden');
-                    UI.toast('✅ ' + data.message, 'success');
+                    const taskID = data.task_id;
+                    console.log('[burn] task_id:', taskID);
+
+                    // Bước 2: Mở SSE để nhận progress
+                    currentEventSource = new EventSource('/api/progress/' + taskID);
+                    currentEventSource.onmessage = (event) => {
+                        try {
+                            const p = JSON.parse(event.data);
+                            updateProgress(p);
+                        } catch (e) {
+                            console.warn('[sse] parse error:', e);
+                        }
+                    };
+                    currentEventSource.onerror = (e) => {
+                        console.warn('[sse] connection error', e);
+                        // Không tự đóng — server sẽ đóng khi done/error
+                    };
                 } catch (err) {
                     UI.toast('Error: ' + err.message, 'error');
-                } finally {
-                    btnBurn.dataset.busy = '0';
-                    btnBurn.innerHTML = '🔥 Burn subtitles';
-                    Subtitle.updateBurnButton();
+                    if (progressBar) progressBar.classList.add('error');
+                    finalize();
                 }
             }
 
-            return { burn };
+            return { burn, hideProgress };
         })();
 
         // ============================================================
