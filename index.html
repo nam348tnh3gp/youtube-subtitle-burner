@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>YouTube Subtitle Burner</title>
+    <style>
+        * { box-sizing: border-box; font-family: system-ui, -apple-system, sans-serif; }
+        body { max-width: 1000px; margin: 2rem auto; padding: 0 1rem; background: #f9fafb; }
+        h1 { color: #1f2937; }
+        .card { background: white; border-radius: 12px; padding: 1.5rem; box-shadow: 0 1px 3px rgba(0,0,0,0.1); margin-bottom: 1.5rem; }
+        label { display: block; font-weight: 600; margin-bottom: 0.5rem; color: #374151; font-size: 0.9rem; }
+        input, select { width: 100%; padding: 0.75rem; border: 1px solid #d1d5db; border-radius: 8px; font-size: 1rem; }
+        .row { display: flex; gap: 1rem; flex-wrap: wrap; margin-top: 1rem; }
+        .row > div { flex: 1; min-width: 160px; }
+        button { background: #2563eb; color: white; border: none; padding: 0.75rem 1.5rem; border-radius: 8px; font-size: 1rem; font-weight: 600; cursor: pointer; }
+        button:hover { background: #1d4ed8; }
+        button:disabled { background: #9ca3af; cursor: not-allowed; }
+        .status { margin-top: 1rem; padding: 0.75rem; border-radius: 8px; display: none; }
+        .status.error { background: #fee2e2; color: #991b1b; display: block; }
+        .status.success { background: #d1fae5; color: #065f46; display: block; }
+        iframe, video { width: 100%; border-radius: 8px; margin-top: 1rem; aspect-ratio: 16/9; border: none; background: #000; }
+        .spinner { display: inline-block; width: 1rem; height: 1rem; border: 2px solid #fff; border-top-color: transparent; border-radius: 50%; animation: spin 0.6s linear infinite; margin-right: 0.5rem; vertical-align: middle; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .hidden { display: none; }
+        .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+        @media (max-width: 800px) { .grid { grid-template-columns: 1fr; } }
+        .badge { display: inline-block; padding: 0.15rem 0.5rem; background: #eff6ff; color: #1d4ed8; border-radius: 6px; font-size: 0.75rem; font-weight: 700; margin-left: 0.5rem; vertical-align: middle; }
+        .btn-row { display: flex; gap: 1rem; flex-wrap: wrap; margin-top: 1.25rem; }
+        .hint { font-size: 0.75rem; color: #6b7280; margin-top: 0.25rem; }
+
+        .tabs { display: flex; gap: 0.5rem; margin: 0.75rem 0 1rem; border-bottom: 2px solid #e5e7eb; }
+        .tab { padding: 0.5rem 1rem; cursor: pointer; font-weight: 600; color: #6b7280; border-bottom: 2px solid transparent; margin-bottom: -2px; user-select: none; }
+        .tab.active { color: #2563eb; border-bottom-color: #2563eb; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .dropzone { border: 2px dashed #d1d5db; border-radius: 8px; padding: 1.5rem; text-align: center; cursor: pointer; color: #6b7280; transition: all 0.15s; }
+        .dropzone:hover, .dropzone.dragover { border-color: #2563eb; background: #eff6ff; }
+        .dropzone.has-file { border-color: #10b981; background: #ecfdf5; color: #065f46; }
+        .file-info { font-size: 0.9rem; font-weight: 600; }
+        .file-name { font-size: 0.8rem; color: #059669; margin-top: 0.5rem; font-weight: 600; }
+
+        .cookies-box { margin-top: 1rem; padding: 1rem; background: #f9fafb; border-radius: 8px; border: 1px solid #e5e7eb; display: none; }
+        .cookies-box.active { display: block; }
+        .cookies-box textarea { width: 100%; min-height: 120px; padding: 0.5rem; border: 1px solid #d1d5db; border-radius: 6px; font-family: monospace; font-size: 0.8rem; }
+        .inline-radio { display: flex; gap: 1rem; margin: 0.5rem 0; }
+        .inline-radio label { display: flex; align-items: center; gap: 0.35rem; font-weight: 500; margin: 0; cursor: pointer; }
+        .inline-radio input { width: auto; }
+    </style>
+</head>
+<body>
+    <h1>🎬 YouTube Subtitle Burner</h1>
+    <p style="color: #6b7280;">Paste a YouTube link, pick a subtitle, choose quality and font size, then get a video with burned-in subtitles.</p>
+
+    <div class="card">
+        <label for="url">YouTube URL</label>
+        <input type="url" id="url" placeholder="https://www.youtube.com/watch?v=..." required>
+
+        <div class="row">
+            <div style="flex: 100%;">
+                <label>Subtitle source</label>
+                <div class="tabs">
+                    <div class="tab active" data-tab="download" onclick="switchTab('download')">⬇ Download from YouTube</div>
+                    <div class="tab" data-tab="upload" onclick="switchTab('upload')">📁 Import existing file</div>
+                </div>
+
+                <div id="tab-download" class="tab-content active">
+                    <label for="lang">Subtitle language</label>
+                    <select id="lang" disabled>
+                        <option value="">-- Enter URL and click "Fetch subtitles" --</option>
+                    </select>
+                </div>
+
+                <div id="tab-upload" class="tab-content">
+                    <div id="dropzone" class="dropzone" onclick="document.getElementById('subFile').click()">
+                        <div class="file-info">📄 Click or drag & drop a subtitle file here</div>
+                        <div style="font-size:0.75rem; margin-top:0.35rem;">Supports .vtt, .srt</div>
+                        <div id="fileName" class="file-name hidden"></div>
+                    </div>
+                    <input type="file" id="subFile" accept=".vtt,.srt" style="display:none" onchange="handleFileSelect(this.files[0])">
+                </div>
+            </div>
+            <div>
+                <label for="quality">Video quality</label>
+                <select id="quality">
+                    <option value="best" selected>Best (highest)</option>
+                    <option value="1080">1080p</option>
+                    <option value="720">720p</option>
+                    <option value="480">480p</option>
+                    <option value="360">360p</option>
+                </select>
+            </div>
+            <div>
+                <label for="client">Browser cookies</label>
+                <select id="client">
+                    <option value="auto" selected>🔄 Auto (detect all browsers)</option>
+                    <option value="firefox">Firefox</option>
+                    <option value="chrome">Chrome</option>
+                    <option value="chromium">Chromium</option>
+                    <option value="edge">Edge</option>
+                    <option value="brave">Brave</option>
+                    <option value="opera">Opera</option>
+                    <option value="vivaldi">Vivaldi</option>
+                    <option value="safari">Safari (macOS)</option>
+                </select>
+                <p class="hint">Sign in to YouTube on this browser to avoid 429 errors.</p>
+            </div>
+            <div>
+                <label for="player">Device client (yt-dlp)</label>
+                <select id="player">
+                    <option value="auto" selected>🔄 Auto (android_vr + web_safari)</option>
+                    <option value="android_vr">Android VR</option>
+                    <option value="web">Web</option>
+                    <option value="web_safari">Web Safari</option>
+                    <option value="android">Android</option>
+                    <option value="ios">iOS</option>
+                    <option value="mweb">Mobile Web</option>
+                    <option value="tv">TV</option>
+                </select>
+                <p class="hint">Change if the default player returns no subtitles.</p>
+            </div>
+            <div style="flex: 100%; margin-top: 1rem;">
+                <label style="display: flex; align-items: center; gap: 0.5rem; cursor: pointer; font-weight: 600;">
+                    <input type="checkbox" id="useManualCookies" onchange="toggleCookiesBox()" style="width: auto;">
+                    🍪 Use manual cookies (overrides browser cookies)
+                </label>
+                <div id="cookiesBox" class="cookies-box">
+                    <div class="inline-radio">
+                        <label><input type="radio" name="cookieFormat" value="netscape" checked onchange="updateCookieHint()"> Netscape (.txt)</label>
+                        <label><input type="radio" name="cookieFormat" value="json" onchange="updateCookieHint()"> JSON (Cookie-Editor)</label>
+                    </div>
+                    <p id="cookieHint" class="hint">Paste the content of a cookies.txt (Netscape) or upload a file. Each line: domain, flag, path, secure, expires, name, value.</p>
+                    <textarea id="cookiesText" placeholder="Paste cookies here (Netscape) or upload a JSON file below..."></textarea>
+                    <div style="display: flex; gap: 0.5rem; margin-top: 0.75rem; flex-wrap: wrap;">
+                        <button type="button" onclick="document.getElementById('cookiesFile').click()">📁 Upload cookies file (.txt / .json)</button>
+                        <button type="button" onclick="clearCookies()" style="background: #6b7280;">🗑 Clear</button>
+                    </div>
+                    <input type="file" id="cookiesFile" accept=".txt,.json" style="display:none" onchange="handleCookiesFile(this.files[0])">
+                    <div id="cookiesFileName" class="file-name hidden"></div>
+                </div>
+            </div>
+            <div>
+                <label for="fontSize">Subtitle font size</label>
+                <input type="number" id="fontSize" value="24" min="10" max="72">
+            </div>
+        </div>
+
+        <div class="btn-row">
+            <button id="btnPreview" onclick="previewVideo()">👁 Preview video</button>
+            <button id="btnList" onclick="listSubtitles()">🔍 Fetch subtitles</button>
+            <button id="btnBurn" onclick="burnSubtitles()" disabled>🔥 Burn subtitles</button>
+        </div>
+
+        <div id="status" class="status"></div>
+    </div>
+
+    <div class="grid">
+        <div id="previewCard" class="card hidden">
+            <h2>👁 Original video</h2>
+            <iframe id="previewFrame"
+                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                    allowfullscreen></iframe>
+        </div>
+
+        <div id="resultCard" class="card hidden">
+            <h2>🎯 Result video <span class="badge" id="resultBadge">Best</span></h2>
+            <video id="resultVideo" controls></video>
+            <p style="margin-top: 1rem;">
+                <a id="downloadLink" href="#" download style="color: #2563eb; font-weight: 600;">⬇ Download video</a>
+            </p>
+        </div>
+    </div>
+
+    <script>
+        const statusEl = document.getElementById('status');
+        const langSelect = document.getElementById('lang');
+        const qualitySelect = document.getElementById('quality');
+        const clientSelect = document.getElementById('client');
+        const btnBurn = document.getElementById('btnBurn');
+        const btnList = document.getElementById('btnList');
+        const btnPreview = document.getElementById('btnPreview');
+        const resultCard = document.getElementById('resultCard');
+        const resultVideo = document.getElementById('resultVideo');
+        const resultBadge = document.getElementById('resultBadge');
+        const downloadLink = document.getElementById('downloadLink');
+        const previewCard = document.getElementById('previewCard');
+        const previewFrame = document.getElementById('previewFrame');
+        const playerSelect = document.getElementById('player');
+        const subFileInput = document.getElementById('subFile');
+        const dropzone = document.getElementById('dropzone');
+        const fileNameEl = document.getElementById('fileName');
+        const useManualCookies = document.getElementById('useManualCookies');
+        const cookiesBox = document.getElementById('cookiesBox');
+        const cookiesText = document.getElementById('cookiesText');
+        const cookiesFileName = document.getElementById('cookiesFileName');
+        let uploadedCookies = null; // { format, data }
+        let currentTab = 'download';
+        let uploadedSubtitle = null; // { name, base64 }
+
+        function showStatus(msg, type) {
+            statusEl.textContent = msg;
+            statusEl.className = 'status ' + type;
+        }
+        function hideStatus() { statusEl.className = 'status'; statusEl.style.display = 'none'; }
+
+
+        // ===== Tabs nguồn phụ đề =====
+        function switchTab(tab) {
+            currentTab = tab;
+            document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
+            document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+            document.getElementById('tab-' + tab).classList.add('active');
+            updateBurnButtonState();
+        }
+
+        function updateBurnButtonState() {
+            // Nếu đang chạy (nút bị set bởi burnSubtitles) → không đụng vào
+            if (btnBurn.dataset.busy === '1') return;
+
+            const hasUrl = document.getElementById('url').value.trim() !== '';
+            let hasSubtitle = false;
+
+            if (currentTab === 'upload') {
+                hasSubtitle = !!uploadedSubtitle;
+            } else {
+                hasSubtitle = langSelect.value !== '' && !langSelect.disabled;
+            }
+
+            btnBurn.disabled = !(hasUrl && hasSubtitle);
+        }
+
+        // Gọi updateBurnButtonState khi URL thay đổi
+        document.getElementById('url').addEventListener('input', updateBurnButtonState);
+
+        // ===== Upload file phụ đề =====
+        function handleFileSelect(file) {
+            if (!file) return;
+            const name = file.name.toLowerCase();
+            if (!name.endsWith('.vtt') && !name.endsWith('.srt')) {
+                showStatus('Only .vtt or .srt files are supported', 'error');
+                return;
+            }
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                const b64 = e.target.result.split(',')[1];
+                uploadedSubtitle = { name: file.name, base64: b64 };
+                fileNameEl.textContent = '✓ ' + file.name + ' (' + Math.round(file.size / 1024) + ' KB)';
+                fileNameEl.classList.remove('hidden');
+                dropzone.classList.add('has-file');
+                updateBurnButtonState();
+            };
+            reader.onerror = () => showStatus('Could not read file', 'error');
+            reader.readAsDataURL(file);
+        }
+
+        // Drag & drop cho dropzone (chỉ chạy nếu có phần tử)
+        if (dropzone) {
+            ['dragenter', 'dragover'].forEach(ev => dropzone.addEventListener(ev, e => {
+                e.preventDefault(); dropzone.classList.add('dragover');
+            }));
+            ['dragleave', 'drop'].forEach(ev => dropzone.addEventListener(ev, e => {
+                e.preventDefault(); dropzone.classList.remove('dragover');
+            }));
+            dropzone.addEventListener('drop', e => {
+                if (e.dataTransfer.files.length) handleFileSelect(e.dataTransfer.files[0]);
+            });
+        }
+
+
+        // ===== Cookies thủ công =====
+        function toggleCookiesBox() {
+            cookiesBox.classList.toggle('active', useManualCookies.checked);
+        }
+
+        function updateCookieHint() {
+            const fmt = document.querySelector('input[name="cookieFormat"]:checked').value;
+            const hint = document.getElementById('cookieHint');
+            if (fmt === 'json') {
+                hint.textContent = 'Paste JSON from Cookie-Editor (array or {cookies:[...]}), or upload a .json file.';
+                cookiesText.placeholder = '[{"name":"SID","value":"...","domain":".youtube.com",...}]';
+            } else {
+                hint.textContent = 'Paste the content of a cookies.txt (Netscape). Each line: domain, flag, path, secure, expires, name, value.';
+                cookiesText.placeholder = '.youtube.com\tTRUE\t/\tFALSE\t1800000000\tSID\t...';
+            }
+        }
+
+        function clearCookies() {
+            cookiesText.value = '';
+            uploadedCookies = null;
+            cookiesFileName.textContent = '';
+            cookiesFileName.classList.add('hidden');
+        }
+
+        function handleCookiesFile(file) {
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                const content = e.target.result;
+                cookiesText.value = content;
+                // Tự nhận diện format từ đuôi file
+                if (file.name.toLowerCase().endsWith('.json')) {
+                    document.querySelector('input[name="cookieFormat"][value="json"]').checked = true;
+                } else {
+                    document.querySelector('input[name="cookieFormat"][value="netscape"]').checked = true;
+                }
+                updateCookieHint();
+                cookiesFileName.textContent = '✓ ' + file.name + ' (' + Math.round(file.size / 1024) + ' KB)';
+                cookiesFileName.classList.remove('hidden');
+            };
+            reader.readAsText(file);
+        }
+
+        function getCookiesPayload() {
+            if (!useManualCookies.checked) return null;
+            const raw = cookiesText.value.trim();
+            if (!raw) {
+                console.warn('[cookies] enabled but empty');
+                showStatus('Manual cookies is enabled but no content was provided', 'error');
+                return false;
+            }
+
+            const fmt = document.querySelector('input[name="cookieFormat"]:checked').value;
+            if (fmt === 'json') {
+                // JSON phải base64 hóa để tránh ký tự đặc biệt trong JSON body
+                try {
+                    JSON.parse(raw);
+                } catch (e) {
+                    showStatus('Invalid JSON cookies: ' + e.message, 'error');
+                    return false;
+                }
+                // base64 UTF-8 an toàn
+                const b64 = btoa(unescape(encodeURIComponent(raw)));
+                return { format: 'json', data: b64 };
+            }
+            // Netscape: gửi thô
+            return { format: 'netscape', data: raw };
+        }
+
+        async function previewVideo() {
+            const url = document.getElementById('url').value.trim();
+            if (!url) { showStatus('Please enter a YouTube URL', 'error'); return; }
+
+            btnPreview.disabled = true;
+            btnPreview.innerHTML = '<span class="spinner"></span> Loading...';
+            hideStatus();
+
+            try {
+                const res = await fetch('/api/preview', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url })
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error || 'Unknown error');
+
+                previewFrame.src = data.embed_url;
+                previewCard.classList.remove('hidden');
+                showStatus('Preview loaded', 'success');
+            } catch (err) {
+                showStatus('Error: ' + err.message, 'error');
+            } finally {
+                btnPreview.disabled = false;
+                btnPreview.innerHTML = '👁 Preview video';
+            }
+        }
+
+        async function listSubtitles() {
+            const url = document.getElementById('url').value.trim();
+            if (!url) { showStatus('Please enter a YouTube URL', 'error'); return; }
+
+            btnList.disabled = true;
+            btnList.innerHTML = '<span class="spinner"></span> Fetching...';
+            hideStatus();
+            langSelect.innerHTML = '<option value="">Loading...</option>';
+            langSelect.disabled = true;
+            btnBurn.disabled = true;
+
+            try {
+                const res = await fetch('/api/subtitles', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url })
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error || 'Unknown error');
+
+                langSelect.innerHTML = '';
+                if (data.subtitles.length === 0) {
+                    langSelect.innerHTML = '<option value="">No subtitles</option>';
+                } else {
+                    data.subtitles.forEach(s => {
+                        const opt = document.createElement('option');
+                        opt.value = s.language;
+                        opt.textContent = s.language + ' - ' + s.name;
+                        langSelect.appendChild(opt);
+                    });
+                    langSelect.disabled = false;
+                    if (currentTab === 'download') updateBurnButtonState();
+                }
+                showStatus('Found ' + data.subtitles.length + ' subtitles for: ' + data.title, 'success');
+            } catch (err) {
+                showStatus('Error: ' + err.message, 'error');
+                langSelect.innerHTML = '<option value="">-- Error --</option>';
+            } finally {
+                btnList.disabled = false;
+                btnList.innerHTML = '🔍 Fetch subtitles';
+            }
+        }
+
+        async function burnSubtitles() {
+            const url = document.getElementById('url').value.trim();
+            const quality = qualitySelect.value;
+            const client = clientSelect.value;
+            const player = playerSelect.value;
+            const fontSize = parseInt(document.getElementById('fontSize').value, 10);
+
+            if (!url) { showStatus('Please enter a YouTube URL', 'error'); return; }
+            if (isNaN(fontSize) || fontSize < 10 || fontSize > 72) {
+                showStatus('Font size must be between 10 and 72', 'error'); return;
+            }
+
+            console.log('[burn] payload inputs:', { url, quality, client, player, fontSize, currentTab });
+
+            const cookiesPayload = getCookiesPayload();
+            if (cookiesPayload === false) {
+                console.warn('[burn] aborted: invalid cookies payload');
+                return;
+            }
+
+            const payload = { url, quality, client, player, font_size: fontSize };
+            if (cookiesPayload) {
+                payload.cookies_data = cookiesPayload.data;
+                payload.cookies_format = cookiesPayload.format;
+            }
+
+            if (currentTab === 'upload') {
+                if (!uploadedSubtitle) { showStatus('No subtitle file selected', 'error'); return; }
+                payload.subtitle_name = uploadedSubtitle.name;
+                payload.subtitle_data = uploadedSubtitle.base64;
+                payload.lang = 'uploaded'; // giá trị giả, backend bỏ qua khi có subtitle_data
+            } else {
+                const lang = langSelect.value;
+                if (!lang) { showStatus('Please select a subtitle language', 'error'); return; }
+                payload.lang = lang;
+            }
+
+            btnBurn.dataset.busy = '1';
+            btnBurn.disabled = true;
+            btnBurn.innerHTML = '<span class="spinner"></span> Processing... (may take a few minutes)';
+            hideStatus();
+            resultCard.classList.add('hidden');
+
+            try {
+                const res = await fetch('/api/burn', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error || 'Unknown error');
+
+                resultVideo.src = data.video_url;
+                downloadLink.href = data.video_url;
+                resultBadge.textContent = quality === 'best' ? 'Best' : quality + 'p';
+                resultCard.classList.remove('hidden');
+                showStatus('✅ ' + data.message, 'success');
+            } catch (err) {
+                showStatus('Error: ' + err.message, 'error');
+            } finally {
+                btnBurn.dataset.busy = '0';
+                btnBurn.innerHTML = '🔥 Burn subtitles';
+                updateBurnButtonState();
+            }
+        }
+    </script>
+</body>
+</html>
