@@ -33,7 +33,7 @@ jobs:
           pip install yt-dlp
 
       - name: Build
-        run: go build -o youtube-subtitle-burner .
+        run: go get youtube-subtitle-burner ;go build -o youtube-subtitle-burner .
 
       - name: Run server (background)
         run: |
