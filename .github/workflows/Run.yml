@@ -1,0 +1,63 @@
+name: Build & Run with ngrok Tunnel
+
+on:
+  workflow_dispatch:
+    inputs:
+      ngrok_token:
+        description: 'ngrok auth token (để trống sẽ dùng secret NGROK_AUTH_TOKEN)'
+        required: false
+        type: string
+      run_duration:
+        description: 'Thời gian chạy tunnel (phút)'
+        required: false
+        default: '60'
+        type: string
+
+jobs:
+  build-and-tunnel:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(github.event.inputs.run_duration || 60) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          pip install yt-dlp
+
+      - name: Build
+        run: go build -o youtube-subtitle-burner .
+
+      - name: Run server (background)
+        run: |
+          nohup ./youtube-subtitle-burner > server.log 2>&1 &
+          echo "Server PID: $!"
+          sleep 3
+          curl -s -o /dev/null -w "%{http_code}" http://localhost:8988/ || true
+
+      - name: Setup ngrok
+        uses: ngrok/ngrok-actions@v1
+        with:
+          authtoken: ${{ github.event.inputs.ngrok_token || secrets.NGROK_AUTH_TOKEN }}
+          command: http 8988 --log stdout
+        # Hoặc dùng cách thủ công nếu action trên không khả dụng:
+        # env:
+        #   NGROK_AUTHTOKEN: ${{ github.event.inputs.ngrok_token || secrets.NGROK_AUTH_TOKEN }}
+
+      - name: Show ngrok URL
+        run: |
+          echo "=== ngrok tunnel đã mở ==="
+          # Action sẽ log URL trong bước trước, hoặc có thể curl API local
+          curl -s http://localhost:4040/api/tunnels | jq '.tunnels[0].public_url' || true
+
+      - name: Keep alive
+        run: |
+          echo "Tunnel đang chạy. Thời gian: ${{ github.event.inputs.run_duration || 60 }} phút"
+          sleep $(( ${{ github.event.inputs.run_duration || 60 }} * 60 ))
