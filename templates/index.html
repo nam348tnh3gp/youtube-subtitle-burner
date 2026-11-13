@@ -53,8 +53,25 @@
     <p style="color: #6b7280;">Paste a YouTube link, pick a subtitle, choose quality and font size, then get a video with burned-in subtitles.</p>
 
     <div class="card">
-        <label for="url">YouTube URL</label>
-        <input type="url" id="url" placeholder="https://www.youtube.com/watch?v=..." required>
+        <label>Video source</label>
+        <div class="tabs">
+            <div class="tab active" data-vtab="youtube" onclick="switchVideoTab('youtube')">▶ YouTube URL</div>
+            <div class="tab" data-vtab="upload-video" onclick="switchVideoTab('upload-video')">📁 Upload video</div>
+        </div>
+
+        <div id="vtab-youtube" class="tab-content active">
+            <label for="url">YouTube URL</label>
+            <input type="url" id="url" placeholder="https://www.youtube.com/watch?v=...">
+        </div>
+
+        <div id="vtab-upload-video" class="tab-content">
+            <div id="videoDropzone" class="dropzone" onclick="document.getElementById('videoFile').click()">
+                <div class="file-info">🎬 Click or drag & drop a video file here</div>
+                <div style="font-size:0.75rem; margin-top:0.35rem;">Supports .mp4, .mkv, .webm, .mov, .avi</div>
+                <div id="videoFileName" class="file-name hidden"></div>
+            </div>
+            <input type="file" id="videoFile" accept="video/*,.mkv" style="display:none" onchange="handleVideoFileSelect(this.files[0])">
+        </div>
 
         <div class="row">
             <div style="flex: 100%;">
@@ -204,6 +221,54 @@
         function hideStatus() { statusEl.className = 'status'; statusEl.style.display = 'none'; }
 
 
+
+        // ===== Tabs Video source =====
+        function switchVideoTab(tab) {
+            currentVideoTab = tab;
+            document.querySelectorAll('.tab[data-vtab]').forEach(t => t.classList.toggle('active', t.dataset.vtab === tab));
+            document.getElementById('vtab-youtube').classList.toggle('active', tab === 'youtube');
+            document.getElementById('vtab-upload-video').classList.toggle('active', tab === 'upload-video');
+            updateBurnButtonState();
+        }
+
+        function handleVideoFileSelect(file) {
+            if (!file) return;
+            const name = file.name.toLowerCase();
+            const okExts = ['.mp4', '.mkv', '.webm', '.mov', '.avi', '.m4v'];
+            if (!okExts.some(ext => name.endsWith(ext))) {
+                showStatus('Only ' + okExts.join(', ') + ' are supported', 'error');
+                return;
+            }
+            // Giới hạn 500MB
+            if (file.size > 500 * 1024 * 1024) {
+                showStatus('Video quá lớn (>500MB). Vui lòng chọn file nhỏ hơn.', 'error');
+                return;
+            }
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                const b64 = e.target.result.split(',')[1];
+                uploadedVideo = { name: file.name, base64: b64 };
+                videoFileName.textContent = '✓ ' + file.name + ' (' + (file.size / 1024 / 1024).toFixed(1) + ' MB)';
+                videoFileName.classList.remove('hidden');
+                videoDropzone.classList.add('has-file');
+                updateBurnButtonState();
+            };
+            reader.onerror = () => showStatus('Could not read video file', 'error');
+            reader.readAsDataURL(file);
+        }
+
+        if (videoDropzone) {
+            ['dragenter', 'dragover'].forEach(ev => videoDropzone.addEventListener(ev, e => {
+                e.preventDefault(); videoDropzone.classList.add('dragover');
+            }));
+            ['dragleave', 'drop'].forEach(ev => videoDropzone.addEventListener(ev, e => {
+                e.preventDefault(); videoDropzone.classList.remove('dragover');
+            }));
+            videoDropzone.addEventListener('drop', e => {
+                if (e.dataTransfer.files.length) handleVideoFileSelect(e.dataTransfer.files[0]);
+            });
+        }
+
         // ===== Tabs nguồn phụ đề =====
         function switchTab(tab) {
             currentTab = tab;
@@ -214,19 +279,25 @@
         }
 
         function updateBurnButtonState() {
-            // Nếu đang chạy (nút bị set bởi burnSubtitles) → không đụng vào
             if (btnBurn.dataset.busy === '1') return;
 
-            const hasUrl = document.getElementById('url').value.trim() !== '';
-            let hasSubtitle = false;
+            // Có video nguồn?
+            let hasVideoSource = false;
+            if (currentVideoTab === 'youtube') {
+                hasVideoSource = document.getElementById('url').value.trim() !== '';
+            } else {
+                hasVideoSource = !!uploadedVideo;
+            }
 
+            // Có phụ đề?
+            let hasSubtitle = false;
             if (currentTab === 'upload') {
                 hasSubtitle = !!uploadedSubtitle;
             } else {
                 hasSubtitle = langSelect.value !== '' && !langSelect.disabled;
             }
 
-            btnBurn.disabled = !(hasUrl && hasSubtitle);
+            btnBurn.disabled = !(hasVideoSource && hasSubtitle);
         }
 
         // Gọi updateBurnButtonState khi URL thay đổi
@@ -414,7 +485,12 @@
             const player = playerSelect.value;
             const fontSize = parseInt(document.getElementById('fontSize').value, 10);
 
-            if (!url) { showStatus('Please enter a YouTube URL', 'error'); return; }
+            // Validate video source
+            if (currentVideoTab === 'youtube') {
+                if (!url) { showStatus('Please enter a YouTube URL', 'error'); return; }
+            } else {
+                if (!uploadedVideo) { showStatus('Please select a video file to upload', 'error'); return; }
+            }
             if (isNaN(fontSize) || fontSize < 10 || fontSize > 72) {
                 showStatus('Font size must be between 10 and 72', 'error'); return;
             }
@@ -431,6 +507,12 @@
             if (cookiesPayload) {
                 payload.cookies_data = cookiesPayload.data;
                 payload.cookies_format = cookiesPayload.format;
+            }
+            if (currentVideoTab === 'upload-video' && uploadedVideo) {
+                payload.video_name = uploadedVideo.name;
+                payload.video_data = uploadedVideo.base64;
+                // Không cần URL khi upload video
+                payload.url = '';
             }
 
             if (currentTab === 'upload') {
