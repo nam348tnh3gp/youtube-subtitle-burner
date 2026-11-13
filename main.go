@@ -20,7 +20,7 @@ import (
 
 // Cấu trúc request từ form
 type BurnRequest struct {
-	URL      string `json:"url" binding:"required"`
+	URL      string `json:"url"`
 	Lang     string `json:"lang" binding:"required"` // ví dụ: "vi", "en"
 	FontSize int    `json:"font_size" binding:"required,min=10,max=72"`
 	Quality  string `json:"quality"` // "360" | "480" | "720" | "1080" | "best"
@@ -34,6 +34,10 @@ type BurnRequest struct {
 // "netscape": nội dung thô | "json": base64 mảng JSON (Cookie-Editor)
 CookiesData   string `json:"cookies_data"`
 CookiesFormat string `json:"cookies_format"`
+
+	// Video upload (nếu có → bỏ qua tải YouTube)
+	VideoName string `json:"video_name"` // vd "my-video.mp4"
+	VideoData string `json:"video_data"` // base64 nội dung file
 }
 
 // Cấu trúc phụ đề trả về cho frontend
@@ -176,6 +180,11 @@ func handleBurnSubtitles(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Dữ liệu không hợp lệ: " + err.Error()})
 		return
 	}
+	// URL không bắt buộc nếu có video upload hoặc phụ đề upload
+	if strings.TrimSpace(req.URL) == "" && strings.TrimSpace(req.VideoData) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Cần nhập link YouTube hoặc upload video"})
+		return
+	}
 
 	// Tạo ID duy nhất cho tác vụ
 	taskID := uuid.New().String()
@@ -191,22 +200,46 @@ func handleBurnSubtitles(c *gin.Context) {
 	assPath := filepath.Join(workDir, "subtitle.ass")
 	outputPath := filepath.Join(workDir, "output.mp4")
 
-	// Bước 1: Tải video
-	log.Printf("[%s] Đang tải video: %s", taskID, req.URL)
-	formatSel := buildFormatSelector(req.Quality)
-	log.Printf("[%s] Format selector: %s", taskID, formatSel)
-	downloadCmd := exec.Command("yt-dlp",
-		"-f", formatSel,
-		"--merge-output-format", "mp4",
-		"-o", videoPath,
-		"--no-warnings",
-		req.URL,
-	)
-	downloadCmd.Stdout = os.Stdout
-	downloadCmd.Stderr = os.Stderr
-	if err := downloadCmd.Run(); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Tải video thất bại: " + err.Error()})
-		return
+	// Bước 1: Lấy video — ưu tiên file upload nếu có, ngược lại tải từ YouTube
+	if strings.TrimSpace(req.VideoData) != "" {
+		// Người dùng import video có sẵn
+		raw, err := base64.StdEncoding.DecodeString(req.VideoData)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Dữ liệu video base64 không hợp lệ: " + err.Error()})
+			return
+		}
+		// Giữ đuôi file gốc để FFmpeg tự nhận diện container
+		ext := filepath.Ext(req.VideoName)
+		if ext == "" {
+			ext = ".mp4"
+		}
+		videoPath = filepath.Join(workDir, "uploaded_video"+ext)
+		if err := os.WriteFile(videoPath, raw, 0644); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Không ghi được file video upload"})
+			return
+		}
+		log.Printf("[%s] Dùng video upload: %s (%d bytes)", taskID, videoPath, len(raw))
+	} else {
+		if strings.TrimSpace(req.URL) == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Cần nhập link YouTube hoặc upload video"})
+			return
+		}
+		log.Printf("[%s] Đang tải video: %s", taskID, req.URL)
+		formatSel := buildFormatSelector(req.Quality)
+		log.Printf("[%s] Format selector: %s", taskID, formatSel)
+		downloadCmd := exec.Command("yt-dlp",
+			"-f", formatSel,
+			"--merge-output-format", "mp4",
+			"-o", videoPath,
+			"--no-warnings",
+			req.URL,
+		)
+		downloadCmd.Stdout = os.Stdout
+		downloadCmd.Stderr = os.Stderr
+		if err := downloadCmd.Run(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Tải video thất bại: " + err.Error()})
+			return
+		}
 	}
 
 	// Bước 2: Lấy phụ đề — ưu tiên file upload nếu có, ngược lại tải từ YouTube
